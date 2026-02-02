@@ -1,0 +1,40 @@
+{
+  "blocks": [
+    [
+      "9f29d54e35f1fabbf315da8151413cfdb44e2cd6027fc332146605c410d1de7e",
+      [
+        "115114289359a6f265be29cc70048b814292f50fd83ca4cae7de0d564bd23e7a"
+      ]
+    ]
+  ],
+  "reports": [
+    {
+      "reporter": "TGJtoiacPDz3An5GAAAD",
+      "target": "115114289359a6f265be29cc70048b814292f50fd83ca4cae7de0d564bd23e7a",
+      "reason": "User reported via chat button",
+      "time": 1770022988209
+    },
+    {
+      "reporter": "9f29d54e35f1fabbf315da8151413cfdb44e2cd6027fc332146605c410d1de7e",
+      "target": "115114289359a6f265be29cc70048b814292f50fd83ca4cae7de0d564bd23e7a",
+      "reason": "User reported via chat button",
+      "time": 1770024168891
+    }
+  ],
+  "bans": [],
+  "matchCounts": [
+    [
+      "115114289359a6f265be29cc70048b814292f50fd83ca4cae7de0d564bd23e7a",
+      5
+    ],
+    [
+      "9ead3d13b4c2fcf2c3272c6b640e7c59",
+      7
+    ],
+    [
+      "9f29d54e35f1fabbf315da8151413cfdb44e2cd6027fc332146605c410d1de7e",
+      6
+    ]
+  ],
+  "lastReset": 1770022235544
+}
