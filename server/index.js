@@ -5,6 +5,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 dotenv.config();
 
@@ -44,6 +45,42 @@ const REPORT_THRESHOLD = Number(process.env.REPORT_THRESHOLD || 5);
 const REPORT_TTL_SECONDS = Number(process.env.REPORT_TTL_SECONDS || 7 * 24 * 60 * 60);
 const MATCH_COUNT_TTL_SECONDS = Number(process.env.MATCH_COUNT_TTL_SECONDS || 48 * 60 * 60);
 const GENDER_SERVICE_URL = normalizeBaseUrl(process.env.GENDER_SERVICE_URL || 'http://localhost:8000');
+const VERIFICATION_TOKEN_TTL_SECONDS = Number(process.env.VERIFICATION_TOKEN_TTL_SECONDS || 24 * 60 * 60);
+const VERIFICATION_TOKEN_SECRET = process.env.VERIFICATION_TOKEN_SECRET || 'dev_only_change_me';
+if (!process.env.VERIFICATION_TOKEN_SECRET) {
+  console.warn('WARNING: VERIFICATION_TOKEN_SECRET is not set. Use a strong secret in production.');
+}
+
+function signVerificationToken(payload) {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', VERIFICATION_TOKEN_SECRET)
+    .update(encoded)
+    .digest('base64url');
+  return `${encoded}.${signature}`;
+}
+
+function verifyVerificationToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encoded, signature] = parts;
+  const expected = crypto
+    .createHmac('sha256', VERIFICATION_TOKEN_SECRET)
+    .update(encoded)
+    .digest('base64url');
+  const signatureOk =
+    signature.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  if (!signatureOk) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (!payload || !payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+  } catch (err) {
+    return null;
+  }
+}
 
 // Redis Clients Configuration (Horizontal Scaling Layer)
 const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -316,6 +353,19 @@ io.on('connection', async (socket) => {
       socket.emit('error', { message: 'Invalid profile data. Please complete your profile first.' });
       return;
     }
+    if (!userData.gender || !userData.genderVerified) {
+      socket.emit('error', { message: 'Gender verification is required before matching.' });
+      return;
+    }
+    const verificationPayload = verifyVerificationToken(userData.verificationToken);
+    if (
+      !verificationPayload ||
+      verificationPayload.deviceId !== userData.deviceId ||
+      verificationPayload.gender !== userData.gender
+    ) {
+      socket.emit('error', { message: 'Verification expired or invalid. Please verify again.' });
+      return;
+    }
     // Check for active bans (Redis-Backed)
     const banInfo = await getBans(userData.deviceId);
     if (banInfo) {
@@ -578,8 +628,9 @@ async function queryHuggingFace(imageBuffer) {
  */
 app.post('/api/verify', async (req, res) => {
   metrics.verificationAttempts++;
-  const { image } = req.body;
+  const { image, deviceId } = req.body;
   if (!image) return res.status(400).json({ verified: false, error: 'Image data required' });
+  if (!deviceId) return res.status(400).json({ verified: false, error: 'Device ID required' });
 
   try {
     // Convert base64 to Buffer (processed in-memory)
@@ -611,10 +662,18 @@ app.post('/api/verify', async (req, res) => {
     if (data.verified === true) {
       metrics.verificationSuccess++;
       console.log(`Gender Service: Verification successful - Gender: ${data.gender}`);
+      const expiresAt = Date.now() + VERIFICATION_TOKEN_TTL_SECONDS * 1000;
+      const token = signVerificationToken({
+        deviceId,
+        gender: data.gender,
+        exp: expiresAt
+      });
       
       res.json({
         verified: true,
-        gender: data.gender
+        gender: data.gender,
+        verificationToken: token,
+        expiresAt
       });
     } else {
       console.log(`Gender Service: Verification failed - ${data.error}`);

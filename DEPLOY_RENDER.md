@@ -21,12 +21,14 @@ Environment variables:
 - `REDIS_URL` = your Render Redis connection string
 - `CLIENT_ORIGINS` = `https://<your-frontend>.onrender.com`
 - `GENDER_SERVICE_URL` = `https://<your-gender-service>.onrender.com`
+- `VERIFICATION_TOKEN_SECRET` = strong random string (required in production)
 - `HF_API_TOKEN` = optional (only if you plan to call Hugging Face from server)
 - Optional tuning:
   - `DAILY_MATCH_LIMIT` (default `100`)
   - `REPORT_THRESHOLD` (default `5`)
   - `REPORT_TTL_SECONDS` (default `604800`)
   - `MATCH_COUNT_TTL_SECONDS` (default `172800`)
+  - `VERIFICATION_TOKEN_TTL_SECONDS` (default `86400`)
 
 Render automatically provides `PORT`.
 
