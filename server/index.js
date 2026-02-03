@@ -14,7 +14,11 @@ const { createClient } = require('redis');
 const normalizeOrigin = (origin) => (origin ? origin.replace(/\/$/, '') : origin);
 const normalizeBaseUrl = (url) => (url ? url.replace(/\/$/, '') : url);
 
-const DEFAULT_CLIENT_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+const DEFAULT_CLIENT_ORIGINS = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'https://klymo-client-cnxt.vercel.app'
+];
 const envOrigins = (process.env.CLIENT_ORIGINS || process.env.CLIENT_ORIGIN || '')
   .split(',')
   .map((origin) => normalizeOrigin(origin.trim()))
