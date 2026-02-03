@@ -1,0 +1,59 @@
+[dotenv@17.2.3] injecting env (2) from .env -- tip: 🛠️  run anywhere with `dotenvx run -- yourcommand`
+Server running on port 3002
+User connected: OxyDhMdeGAVMYNJsAAAB
+User OxyDhMdeGAVMYNJsAAAB joined room test_room
+User disconnected: OxyDhMdeGAVMYNJsAAAB
+User connected: 8rCn9VZyY3Uf8kggAAAD
+User 8rCn9VZyY3Uf8kggAAAD joined room test_room
+User disconnected: 8rCn9VZyY3Uf8kggAAAD
+User connected: Me9C9TPXqdddR260AAAF
+User Me9C9TPXqdddR260AAAF joined room test_room
+User disconnected: Me9C9TPXqdddR260AAAF
+User connected: ncjroWo4_mpbsSwiAAAH
+User ncjroWo4_mpbsSwiAAAH joined room test_room
+User disconnected: ncjroWo4_mpbsSwiAAAH
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+User connected: T6FCr0imXVDgA5P1AAAJ
+Matching for hjfabldflae (M) looking for Any
+Queue: Added hjfabldflae. Total Size: 1
+User disconnected: T6FCr0imXVDgA5P1AAAJ
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+User connected: 8uwlFArJmayc8Ta-AAAL
+Matching for oifehheik (M) looking for Any
+Queue: Added oifehheik. Total Size: 1
+User disconnected: 8uwlFArJmayc8Ta-AAAL
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+User connected: o-WZ5m-cyTlURjcsAAAN
+Matching for hdablkad (M) looking for M
+Queue: Added hdablkad. Total Size: 1
+User disconnected: o-WZ5m-cyTlURjcsAAAN
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+User connected: rkG4EDpJ53YCy76TAAAP
+Matching for fksdbfks (M) looking for M
+Queue: Added fksdbfks. Total Size: 1
+User connected: OJ0r4j_PkgJ4te_1AAAS
+User disconnected: OJ0r4j_PkgJ4te_1AAAS
+Gender Service: Forwarding to Python gender detection service...
+Gender Service: Verification successful - Gender: M
+User connected: UuRdoWDjTUXtp5GEAAAV
+Matching for jkdsbf (M) looking for M
+Trace matching jkdsbf vs fksdbfks:
+  - IDs: d29986db vs 2442c9a7
+  - Status: sameDevice=false, genderMatch=true, partnerPrefMatch=true
+  - Blocks: isBlocked=undefined, Repeat: isRepeat=false
+Match detected between jkdsbf and fksdbfks. Session started: room_UuRdoWDjTUXtp5GEAAAV_rkG4EDpJ53YCy76TAAAP
+User disconnected: UuRdoWDjTUXtp5GEAAAV
+User disconnected: rkG4EDpJ53YCy76TAAAP
+User connected: lrhYmztxOP70sL0_AAAa
+User connected: BscwMAsY_hsJswY8AAAb
+User lrhYmztxOP70sL0_AAAa joined room room_UuRdoWDjTUXtp5GEAAAV_rkG4EDpJ53YCy76TAAAP
+User BscwMAsY_hsJswY8AAAb joined room room_UuRdoWDjTUXtp5GEAAAV_rkG4EDpJ53YCy76TAAAP
+Privacy Engine: Room room_UuRdoWDjTUXtp5GEAAAV_rkG4EDpJ53YCy76TAAAP expired after 5 minutes.
+User disconnected: BscwMAsY_hsJswY8AAAb
+User disconnected: lrhYmztxOP70sL0_AAAa

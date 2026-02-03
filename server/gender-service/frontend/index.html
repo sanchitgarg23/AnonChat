@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gender Verification | Privacy-First AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <span class="icon">🔒</span>
+                <h1>SecureVerify</h1>
+            </div>
+            <div class="status-badge" id="system-status">
+                <span class="dot"></span> System Ready
+            </div>
+        </header>
+
+        <main>
+            <div class="verification-card">
+                <div class="camera-container">
+                    <video id="camera-feed" autoplay playsinline muted></video>
+                    <canvas id="capture-canvas" hidden></canvas>
+                    <div class="scan-overlay">
+                        <div class="scan-line"></div>
+                        <div class="corner topleft"></div>
+                        <div class="corner topright"></div>
+                        <div class="corner bottomleft"></div>
+                        <div class="corner bottomright"></div>
+                    </div>
+                    <div class="placeholder-message" id="camera-placeholder">
+                        <p>Click "Start Camera" to begin</p>
+                    </div>
+                </div>
+
+                <div class="controls">
+                    <button id="start-btn" class="btn primary-btn">
+                        Start Camera
+                    </button>
+                    <button id="verify-btn" class="btn action-btn" disabled>
+                        Verify Identity
+                    </button>
+                </div>
+
+                <div id="result-area" class="result-container hidden">
+                    <div class="loader hidden" id="loader">
+                        <div class="spinner"></div>
+                        <p>Analyzing...</p>
+                    </div>
+                    
+                    <div class="result-content hidden" id="result-content">
+                        <div class="result-icon" id="result-icon"></div>
+                        <h2 id="result-title"></h2>
+                        <p id="result-message"></p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="privacy-note">
+                <h3><span class="lock-icon">🛡️</span> Privacy Guarantee</h3>
+                <p>Images are processed in-memory and deleted immediately. No data is stored or logged.</p>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

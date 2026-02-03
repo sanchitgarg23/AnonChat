@@ -8,136 +8,211 @@ const path = require('path');
 
 dotenv.config();
 
-const STORAGE_PATH = path.join(__dirname, 'storage.json');
+const { createAdapter } = require('@socket.io/redis-adapter');
+const { createClient } = require('redis');
 
-// Helper to save data
-function saveStorage(data = {}) {
-  const serializable = {
-    blocks: Array.from((data.blocks || blocks).entries()).map(([k, v]) => [k, Array.from(v)]),
-    reports: data.reports || reports,
-    bans: Array.from((data.bans || bans).entries()),
-    matchCounts: Array.from((data.matchCounts || matchCounts).entries()),
-    lastReset: data.lastReset || storage.lastReset || Date.now()
-  };
-  fs.writeFileSync(STORAGE_PATH, JSON.stringify(serializable, null, 2));
-}
+const normalizeOrigin = (origin) => (origin ? origin.replace(/\/$/, '') : origin);
+const normalizeBaseUrl = (url) => (url ? url.replace(/\/$/, '') : url);
 
-// Helper to load data
-function loadStorage() {
-  try {
-    if (fs.existsSync(STORAGE_PATH)) {
-      const raw = JSON.parse(fs.readFileSync(STORAGE_PATH));
-      
-      const now = Date.now();
-      const lastReset = raw.lastReset || 0;
-      let counts = new Map(raw.matchCounts || []);
-      
-      if (now - lastReset > 24 * 60 * 60 * 1000) {
-        console.log('Privacy Engine: 24h limit cycle reached. Resetting metadata counts...');
-        counts = new Map();
-        raw.lastReset = now;
-      }
+const DEFAULT_CLIENT_ORIGINS = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+const envOrigins = (process.env.CLIENT_ORIGINS || process.env.CLIENT_ORIGIN || '')
+  .split(',')
+  .map((origin) => normalizeOrigin(origin.trim()))
+  .filter(Boolean);
+const renderExternalUrl = normalizeOrigin(process.env.RENDER_EXTERNAL_URL || '');
 
-      return {
-        blocks: new Map((raw.blocks || []).map(([k, v]) => {
-          const cleanSet = new Set(v);
-          cleanSet.delete(k); // Never allow blocking yourself
-          return [k, cleanSet];
-        })),
-        reports: raw.reports || [],
-        bans: new Map(raw.bans || []),
-        matchCounts: counts,
-        lastReset: raw.lastReset || now
-      };
+const allowedOrigins = new Set(
+  [...DEFAULT_CLIENT_ORIGINS, ...envOrigins, renderExternalUrl].filter(Boolean)
+);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    const normalized = normalizeOrigin(origin);
+    if (allowedOrigins.has(normalized)) return callback(null, true);
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+};
+
+const DAILY_MATCH_LIMIT = Number(process.env.DAILY_MATCH_LIMIT || 100);
+const REPORT_THRESHOLD = Number(process.env.REPORT_THRESHOLD || 5);
+const REPORT_TTL_SECONDS = Number(process.env.REPORT_TTL_SECONDS || 7 * 24 * 60 * 60);
+const MATCH_COUNT_TTL_SECONDS = Number(process.env.MATCH_COUNT_TTL_SECONDS || 48 * 60 * 60);
+const GENDER_SERVICE_URL = normalizeBaseUrl(process.env.GENDER_SERVICE_URL || 'http://localhost:8000');
+
+// Redis Clients Configuration (Horizontal Scaling Layer)
+const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+const pubClient = createClient({ url: redisUrl });
+const subClient = pubClient.duplicate();
+
+pubClient.on('error', (err) => console.error('Redis Pub Error:', err));
+subClient.on('error', (err) => console.error('Redis Sub Error:', err));
+
+(async () => {
+    try {
+        await Promise.all([pubClient.connect(), subClient.connect()]);
+        console.log('Redis Layer: Successfully connected for Scaling-Out');
+    } catch (err) {
+        console.error('Redis Layer: Connection failed. Check your REDIS_URL.', err);
     }
-  } catch (err) {
-    console.error('Privacy Engine: Failed to load storage.json, starting fresh.', err);
-  }
-  return { blocks: new Map(), reports: [], bans: new Map(), matchCounts: new Map(), lastReset: Date.now() };
+})();
+
+
+// Redis State Migration Helpers (Phase 9)
+const REDIS_KEYS = {
+  BANS: 'anonchat:bans',
+  BLOCKS: 'anonchat:blocks:', // suffix with deviceId
+  MATCH_COUNTS_PREFIX: 'anonchat:match_counts:',
+  QUEUE: 'anonchat:queue',
+  REPORTS_TOTAL: 'anonchat:reports:total',
+  REPORTS_SET_PREFIX: 'anonchat:reports:'
+};
+
+function getDailyMatchKey() {
+  const today = new Date().toISOString().slice(0, 10);
+  return `${REDIS_KEYS.MATCH_COUNTS_PREFIX}${today}`;
 }
 
-// Global Error Catching
-process.on('uncaughtException', (err) => {
-  console.error('STASHING ERROR (Uncaught):', err);
-});
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('STASHING REJECTION:', reason);
-});
+async function getBans(deviceId) {
+  const ban = await pubClient.hGet(REDIS_KEYS.BANS, deviceId);
+  return ban ? JSON.parse(ban) : null;
+}
 
-const storage = loadStorage();
-const blocks = storage.blocks;
-const reports = storage.reports;
-const bans = storage.bans;
-const matchCounts = storage.matchCounts;
+async function setBan(deviceId, banInfo) {
+  await pubClient.hSet(REDIS_KEYS.BANS, deviceId, JSON.stringify(banInfo));
+}
 
-// Phase 8: Real-time Metrics Engine
+async function clearBan(deviceId) {
+  await pubClient.hDel(REDIS_KEYS.BANS, deviceId);
+}
+
+async function isBlocked(myDeviceId, targetDeviceId) {
+  return await pubClient.sIsMember(REDIS_KEYS.BLOCKS + myDeviceId, targetDeviceId);
+}
+
+async function addBlock(myDeviceId, targetDeviceId) {
+  await pubClient.sAdd(REDIS_KEYS.BLOCKS + myDeviceId, targetDeviceId);
+}
+
+async function getMatchCount(deviceId) {
+  const count = await pubClient.hGet(getDailyMatchKey(), deviceId);
+  return count ? parseInt(count) : 0;
+}
+
+async function incrementMatchCount(deviceId) {
+  const key = getDailyMatchKey();
+  const multi = pubClient.multi();
+  multi.hIncrBy(key, deviceId, 1);
+  multi.expire(key, MATCH_COUNT_TTL_SECONDS);
+  await multi.exec();
+}
+
+async function recordReport(reporterDeviceId, targetDeviceId) {
+  const reportKey = `${REDIS_KEYS.REPORTS_SET_PREFIX}${targetDeviceId}`;
+  await pubClient.sAdd(reportKey, reporterDeviceId);
+  const uniqueReporters = await pubClient.sCard(reportKey);
+  if (uniqueReporters === 1) {
+    await pubClient.expire(reportKey, REPORT_TTL_SECONDS);
+  }
+  await pubClient.incr(REDIS_KEYS.REPORTS_TOTAL);
+  return uniqueReporters;
+}
+
+// Global Metrics state (Shared via Redis)
 const metrics = {
   totalMatches: 0,
   activeSessions: 0,
   verificationAttempts: 0,
   verificationSuccess: 0,
-  totalReports: reports.length,
-  matchWaitTimes: [] // Array of ms for moving average
+  totalReports: 0, 
+  matchWaitTimes: [] 
 };
 
+// Local reports array (Keeping local for now as it's less critical for scaling)
+const reports = [];
+
+
 // Production-Ready Queue (Bucket D)
-class MatchQueue {
-  constructor() {
-    this.queue = []; // Array of { id, deviceId, gender, matchPreference, timestamp }
+// Production-Ready Redis-Backed Queue (Phase 9)
+class RedisMatchQueue {
+  constructor(io) {
+    this.io = io;
   }
 
-  add(user) {
-    this.queue.push({ ...user, timestamp: Date.now() });
-    console.log(`Queue: Added ${user.nickname}. Total Size: ${this.queue.length}`);
+  async add(user) {
+    // Store full user data in Redis List as a JSON string
+    await pubClient.lPush(REDIS_KEYS.QUEUE, JSON.stringify({ ...user, timestamp: Date.now() }));
+    console.log(`Queue: Added ${user.nickname} to Redis Pool.`);
   }
 
-  remove(socketId) {
-    this.queue = this.queue.filter(u => u.id !== socketId);
+  async remove(socketId) {
+    // In a multi-server environment, we don't have direct access to other servers' sockets.
+    // However, usually, a disconnect event on one server will trigger a cleanup.
+    // Since we store JSON, we'd need to fetch and filter, which is expensive.
+    // Optimization: Just filter during the matching process if the user is no longer connected.
   }
 
-  findMatch(user) {
-    // Priority: FIFO (First In First Out) + Filters
-    const partnerIndex = this.queue.findIndex(u => {
-      const selfMatch = u.id === user.id;
-      const sameDevice = u.deviceId === user.deviceId; // Professional Safety Rule
-      // DEV OVERRIDE: To allow testing in multiple tabs, we slacken the sameDevice rule
-      const allowSameDevice = true; // Set to false in high-security production
-      
-      const genderMatch = (user.matchPreference === 'Any' || u.gender === user.matchPreference);
-      const partnerPrefMatch = (u.matchPreference === 'Any' || user.gender === u.matchPreference);
-      
-      const userABlockedB = blocks.get(user.deviceId)?.has(u.deviceId);
-      const userBBlockedA = blocks.get(u.deviceId)?.has(user.deviceId);
-      const isBlocked = userABlockedB || userBBlockedA;
-
-      const isRepeat = user.lastPartnerId === u.deviceId || u.lastPartnerId === user.deviceId;
-
-      const matchPossible = (allowSameDevice || !sameDevice) && genderMatch && partnerPrefMatch && !isBlocked && !isRepeat;
-
-      // Verbose Debug Trace
-      console.log(`Trace matching ${user.nickname} vs ${u.nickname}:`);
-      console.log(`  - IDs: ${user.deviceId.substring(0,8)} vs ${u.deviceId.substring(0,8)}`);
-      console.log(`  - Status: sameDevice=${sameDevice}, genderMatch=${genderMatch}, partnerPrefMatch=${partnerPrefMatch}`);
-      console.log(`  - Blocks: isBlocked=${isBlocked}, Repeat: isRepeat=${isRepeat}`);
-      
-      if (!matchPossible) {
-        if (sameDevice && !allowSameDevice) console.log(`  -> Match Denied: Same Device Protection Active`);
-        if (!genderMatch || !partnerPrefMatch) console.log(`  -> Match Denied: Gender Preference Mismatch`);
-        if (isBlocked) console.log(`  -> Match Denied: Active Block Found`);
-        if (isRepeat) console.log(`  -> Match Denied: Repeat Partner Protection Active`);
+  async removeBySocketId(socketId) {
+    const queueData = await pubClient.lRange(REDIS_KEYS.QUEUE, 0, -1);
+    for (const item of queueData) {
+      try {
+        const u = JSON.parse(item);
+        if (u.id === socketId) {
+          await pubClient.lRem(REDIS_KEYS.QUEUE, 0, item);
+        }
+      } catch (err) {
+        await pubClient.lRem(REDIS_KEYS.QUEUE, 0, item);
       }
+    }
+  }
 
-      return matchPossible;
-    });
+  async isSocketActive(socketId) {
+    const sockets = await this.io.in(socketId).allSockets();
+    return sockets.has(socketId);
+  }
 
-    if (partnerIndex !== -1) {
-      return this.queue.splice(partnerIndex, 1)[0];
+  async findMatch(user) {
+    // Fetch top 50 candidates from the global pool (Scaling optimization)
+    const queueData = await pubClient.lRange(REDIS_KEYS.QUEUE, 0, 49);
+    
+    for (let i = 0; i < queueData.length; i++) {
+        let u;
+        try {
+          u = JSON.parse(queueData[i]);
+        } catch (err) {
+          await pubClient.lRem(REDIS_KEYS.QUEUE, 0, queueData[i]);
+          continue;
+        }
+        
+        // Compatibility Checks
+        const selfMatch = u.id === user.id;
+        const sameDevice = u.deviceId === user.deviceId;
+        const allowSameDevice = true; // DEV OVERRIDE
+        
+        const genderMatch = (user.matchPreference === 'Any' || u.gender === user.matchPreference);
+        const partnerPrefMatch = (u.matchPreference === 'Any' || user.gender === u.matchPreference);
+        
+        const blocked = await isBlocked(user.deviceId, u.deviceId) || await isBlocked(u.deviceId, user.deviceId);
+        const isRepeat = user.lastPartnerId === u.deviceId || u.lastPartnerId === user.deviceId;
+
+        if (!selfMatch && (allowSameDevice || !sameDevice) && genderMatch && partnerPrefMatch && !blocked && !isRepeat) {
+            const stillConnected = await this.isSocketActive(u.id);
+            if (!stillConnected) {
+                await pubClient.lRem(REDIS_KEYS.QUEUE, 0, queueData[i]);
+                continue;
+            }
+            // Found a match! Try to remove them from the list atomically
+            const removedCount = await pubClient.lRem(REDIS_KEYS.QUEUE, 1, queueData[i]);
+            if (removedCount > 0) {
+                return u;
+            }
+            // If removedCount is 0, someone else snagged this partner. Continue searching.
+        }
     }
     return null;
   }
 }
-
-const matchQueue = new MatchQueue();
 
 // Data Cleanup Policy (Bucket G/4)
 // Automatically clear old match counts every 24 hours to maintain "Controlled Anonymity"
@@ -174,21 +249,21 @@ function rateLimiter(req, res, next) {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(rateLimiter); // Protect all routes
-app.use(cors({
-  origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
-  credentials: true
-}));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: {
-    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
-    methods: ["GET", "POST"],
-    credentials: true
-  }
+  cors: corsOptions,
+  transports: ['websocket', 'polling']
 });
+
+// Implementation of Redis Scaling Adapter (Phase 9)
+io.adapter(createAdapter(pubClient, subClient));
+
+const matchQueue = new RedisMatchQueue(io);
 
 const lastMatchTime = new Map(); // Map of socket.id -> timestamp
 
@@ -206,9 +281,10 @@ function isPIIDetected(text) {
 const BadWordsFilter = require('bad-words');
 const profanityFilter = (typeof BadWordsFilter === 'function') ? new BadWordsFilter() : new BadWordsFilter.Filter();
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   console.log('User connected:', socket.id);
 
+  // ... (validateProfile function remains the same, but it's now inside the async block)
   function validateProfile(data) {
     const { nickname, bio } = data;
     if (!nickname || nickname.trim().length < 3) return "Nickname must be at least 3 characters.";
@@ -227,9 +303,17 @@ io.on('connection', (socket) => {
     return null;
   }
 
-  socket.on('join_queue', (userData) => {
-    // Check for active bans (Bucket F)
-    const banInfo = bans.get(userData.deviceId);
+  socket.on('join_queue', async (userData) => {
+    if (!pubClient.isReady) {
+      socket.emit('error', { message: 'Matchmaking is temporarily unavailable. Please try again shortly.' });
+      return;
+    }
+    if (!userData || !userData.nickname || !userData.deviceId) {
+      socket.emit('error', { message: 'Invalid profile data. Please complete your profile first.' });
+      return;
+    }
+    // Check for active bans (Redis-Backed)
+    const banInfo = await getBans(userData.deviceId);
     if (banInfo) {
       const now = Date.now();
       if (now < banInfo.expiry) {
@@ -237,25 +321,24 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: `Your device is currently banned due to community reports. Expires in ${hoursLeft}h.` });
         return;
       } else {
-        bans.delete(userData.deviceId); // Ban expired
+        await clearBan(userData.deviceId); // Ban expired
       }
     }
 
-    // Validate Profile (Bucket C)
+    // Validate Profile
     const validationError = validateProfile(userData);
     if (validationError) {
       socket.emit('error', { message: validationError });
       return;
     }
 
-    // Enforce Daily Match Limit (Bucket F)
-    const currentMatches = matchCounts.get(userData.deviceId) || 0;
-    if (currentMatches >= 100) {
+    // Enforce Daily Match Limit (Redis-Backed)
+    const currentMatches = await getMatchCount(userData.deviceId);
+    if (currentMatches >= DAILY_MATCH_LIMIT) {
       socket.emit('error', { message: 'Daily match limit reached. Please return tomorrow.' });
       return;
     }
 
-    // Enforce matching cooldown (e.g., 5 seconds between matches)
     const now = Date.now();
     const lastTime = lastMatchTime.get(socket.id) || 0;
     if (now - lastTime < 5000) {
@@ -265,14 +348,20 @@ io.on('connection', (socket) => {
 
     const user = {
       id: socket.id,
+      server: process.pid, // Track which server instance the socket belongs to
       ...userData
     };
     
     console.log(`Matching for ${user.nickname} (${user.gender}) looking for ${user.matchPreference}`);
     
-    // Proper Matching Engine (Bucket D)
-    const startTime = Date.now();
-    const partner = matchQueue.findMatch(user);
+    let partner;
+    try {
+      partner = await matchQueue.findMatch(user);
+    } catch (err) {
+      console.error('Matchmaking error:', err);
+      socket.emit('error', { message: 'Matchmaking is temporarily unavailable. Please try again shortly.' });
+      return;
+    }
 
     if (partner) {
       const roomId = `room_${user.id}_${partner.id}`;
@@ -280,41 +369,32 @@ io.on('connection', (socket) => {
       lastMatchTime.set(user.id, now);
       lastMatchTime.set(partner.id, now);
 
-      // Metrics: Track Match Time (Phase 8)
-      metrics.matchWaitTimes.push(Date.now() - startTime);
-      if (metrics.matchWaitTimes.length > 100) metrics.matchWaitTimes.shift(); // Keep last 100
       metrics.totalMatches++;
       metrics.activeSessions++;
 
-      // Track last partner to prevent immediate repeat (Proper Engine)
       user.lastPartnerId = partner.deviceId;
       partner.lastPartnerId = user.deviceId;
 
-      // Increment Match Counts (Bucket F)
-      matchCounts.set(user.deviceId, (matchCounts.get(user.deviceId) || 0) + 1);
-      matchCounts.set(partner.deviceId, (matchCounts.get(partner.deviceId) || 0) + 1);
-      saveStorage({ blocks, reports, matchCounts });
+      // Increment Match Counts (Redis-Backed)
+      await incrementMatchCount(user.deviceId);
+      await incrementMatchCount(partner.deviceId);
 
       socket.join(roomId);
+      // Cross-server emit works automatically because of Redis Adapter
       io.to(partner.id).emit('match_found', { roomId, partner: user });
       socket.emit('match_found', { roomId, partner: partner });
       
-      console.log(`Match detected between ${user.nickname} and ${partner.nickname}. Session started: ${roomId}`);
-
-      // Phase 7: Session Lifecycle - 5 Minute Room Timeout Enforcement
-      setTimeout(() => {
-        const room = io.sockets.adapter.rooms.get(roomId);
-        if (room) {
-          io.to(roomId).emit('room_expired');
-          console.log(`Privacy Engine: Room ${roomId} expired after 5 minutes.`);
-        }
-      }, 5 * 60 * 1000);
+      console.log(`Match detected: ${user.nickname} <-> ${partner.nickname}`);
     } else {
-      matchQueue.add(user);
+      await matchQueue.add(user);
     }
   });
 
-  socket.on('report_user', ({ reporterDeviceId, targetDeviceId, reason }) => {
+  socket.on('report_user', async ({ reporterDeviceId, targetDeviceId, reason }) => {
+    if (!targetDeviceId) {
+      socket.emit('error', { message: 'Invalid report target.' });
+      return;
+    }
     metrics.totalReports++;
     reports.push({ 
       reporter: reporterDeviceId || socket.id, 
@@ -323,49 +403,47 @@ io.on('connection', (socket) => {
       time: Date.now() 
     });
     
-    // Automated Banning Logic (Bucket F)
-    // If a device reaches 5 unique reporters, ban for 24h
-    const targetReports = reports.filter(r => r.target === targetDeviceId);
-    const uniqueReporters = new Set(targetReports.map(r => r.reporter)).size;
+    // Automated Banning Logic (Redis-Backed)
+    const reporter = reporterDeviceId || socket.id;
+    const uniqueReporters = await recordReport(reporter, targetDeviceId);
     
-    if (uniqueReporters >= 5) {
-      console.log(`Privacy Engine: Automated Ban Triggered for ${targetDeviceId}`);
-      bans.set(targetDeviceId, {
+    if (uniqueReporters >= REPORT_THRESHOLD) {
+      await setBan(targetDeviceId, {
         expiry: Date.now() + (24 * 60 * 60 * 1000),
         reason: 'Multiple community reports'
       });
     }
 
-    saveStorage({ blocks, reports, bans });
-    console.log(`User ${socket.id} reported device ${targetDeviceId}`);
+    console.log(`Report filed against ${targetDeviceId}`);
   });
 
-  socket.on('block_user', ({ myDeviceId, targetDeviceId }) => {
-    if (myDeviceId === targetDeviceId) return;
-    if (!blocks.has(myDeviceId)) {
-      blocks.set(myDeviceId, new Set());
-    }
-    blocks.get(myDeviceId).add(targetDeviceId);
-    saveStorage({ blocks });
-    console.log(`Device ${myDeviceId} blocked device ${targetDeviceId}`);
+  socket.on('block_user', async ({ myDeviceId, targetDeviceId }) => {
+    if (!myDeviceId || !targetDeviceId || myDeviceId === targetDeviceId) return;
+    await addBlock(myDeviceId, targetDeviceId);
+    console.log(`Block active: ${myDeviceId} -> ${targetDeviceId}`);
   });
 
   socket.on('join_room', (roomId) => {
     socket.join(roomId);
-    console.log(`User ${socket.id} joined room ${roomId}`);
   });
 
   socket.on('send_message', ({ roomId, message }) => {
     if (isPIIDetected(message)) {
-      socket.emit('error', { 
-        message: 'Sharing personal information (email/phone) is not allowed for your safety.' 
-      });
+      socket.emit('error', { message: 'Sharing personal information is not allowed.' });
       return;
     }
-
     socket.to(roomId).emit('receive_message', {
       senderId: socket.id,
       text: message,
+      timestamp: Date.now()
+    });
+  });
+
+  socket.on('send_image', ({ roomId, image }) => {
+    if (!image || typeof image !== 'string' || !image.startsWith('data:image')) return;
+    socket.to(roomId).emit('receive_message', {
+      senderId: socket.id,
+      image: image,
       timestamp: Date.now()
     });
   });
@@ -379,76 +457,84 @@ io.on('connection', (socket) => {
     socket.leave(roomId);
   });
 
-  socket.on('disconnect', () => {
-    // Professional Cleanup (Bucket E)
-    // 1. Remove from Queue
-    matchQueue.remove(socket.id);
-    
-    // 2. Notify any active rooms (Session Lifecycle)
+  socket.on('disconnect', async () => {
+    // In cross-server, the socket is already gone from this instance.
+    // Cleanup of the Redis queue is handled during the findMatch process.
     const rooms = Array.from(socket.rooms);
     rooms.forEach(room => {
       if (room.startsWith('room_')) {
-        metrics.activeSessions = Math.max(0, metrics.activeSessions - 0.5); // Pair leaves, reduce by half per socket
+        metrics.activeSessions = Math.max(0, metrics.activeSessions - 0.5);
         socket.to(room).emit('partner_left');
       }
     });
-
+    if (pubClient.isReady) {
+      try {
+        await matchQueue.removeBySocketId(socket.id);
+      } catch (err) {
+        console.error('Queue cleanup error:', err);
+      }
+    }
     console.log('User disconnected:', socket.id);
   });
 });
 
 /**
- * Nuclear Reset (Dev Only)
+ * Nuclear Reset (Phase 9 - Shared Reset)
  */
-app.get('/api/nuclear-reset', (req, res) => {
-  blocks.clear();
-  reports.length = 0;
-  bans.clear();
-  matchCounts.clear();
-  saveStorage({ blocks, reports, bans, matchCounts });
-  console.log('STORM WARNING: Nuclear Reset Triggered. All blocks/reports/bans wiped.');
-  res.json({ success: true, message: 'All test data wiped. Channels are clear.' });
+app.get('/api/nuclear-reset', async (req, res) => {
+  const keys = await pubClient.keys('anonchat:*');
+  if (keys.length > 0) {
+    await pubClient.del(keys);
+  }
+  reports.length = 0; // Local reports cleared on the hit server
+  console.log('STORM WARNING: Global Redis Reset Triggered.');
+  res.json({ success: true, message: 'All cross-server data wiped.' });
 });
 
 /**
- * Phase 8: Admin Analytics API
+ * Phase 8/9: Admin Analytics API (Redis-Backed)
  */
-app.get('/api/admin/metrics', (req, res) => {
-  const avgMatchTime = metrics.matchWaitTimes.length > 0 
-    ? (metrics.matchWaitTimes.reduce((a, b) => a + b, 0) / metrics.matchWaitTimes.length).toFixed(0) 
-    : 0;
-
+app.get('/api/admin/metrics', async (req, res) => {
+  const bansCount = await pubClient.hLen(REDIS_KEYS.BANS);
+  const queueSize = await pubClient.lLen(REDIS_KEYS.QUEUE);
+  const reportsTotal = parseInt((await pubClient.get(REDIS_KEYS.REPORTS_TOTAL)) || '0', 10);
+  
   res.json({
     technical: {
-      avgMatchTimeMs: `${avgMatchTime}ms`,
-      matchTimeLimitMet: avgMatchTime < 5000,
-      activeSessions: metrics.activeSessions,
+      activeSessions: metrics.activeSessions, // Still local approximation
       totalMatchesLife: metrics.totalMatches,
-      queueThroughput: matchQueue.queue.length
+      queueThroughput: queueSize
     },
     safety: {
-      totalReports: reports.length,
-      reportRate: metrics.totalMatches > 0 ? ((reports.length / metrics.totalMatches) * 100).toFixed(1) + '%' : '0%',
-      activeBans: bans.size
-    },
-    user: {
-      verificationSuccessRate: metrics.verificationAttempts > 0 
-        ? ((metrics.verificationSuccess / metrics.verificationAttempts) * 100).toFixed(1) + '%' 
-        : '0%',
-      dropOffAtVerification: metrics.verificationAttempts - metrics.verificationSuccess
+      totalReports: reportsTotal,
+      activeBans: bansCount
     }
   });
 });
 
 /**
- * Real-time Stats API
+ * Real-time Stats API (Redis-Backed)
  */
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
+  const queueSize = await pubClient.lLen(REDIS_KEYS.QUEUE);
+  // io.engine.clientsCount is local to this instance. 
+  // For true global online count, we'd need a Redis counter on connection/disconnection.
   res.json({
-    onlineUsers: io.engine.clientsCount,
-    waitingInQueue: matchQueue.queue.length
+    onlineUsers: io.engine.clientsCount, 
+    waitingInQueue: queueSize
   });
 });
+
+app.get('/healthz', async (req, res) => {
+  res.json({
+    status: 'ok',
+    redis: {
+      pubReady: pubClient.isReady,
+      subReady: subClient.isReady
+    }
+  });
+});
+
 
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
@@ -482,58 +568,81 @@ async function queryHuggingFace(imageBuffer) {
 }
 
 /**
- * Phase 2 & 3: AI Verification Endpoint
- * Proper Backend Implementation (No Mock)
- * Deletion Policy: Immediate Image Deletion (In-memory buffer only)
+ * Gender Verification Endpoint
+ * Proxies to Python-based gender detection service (FastAPI on port 8000)
+ * Maintains privacy-first approach with immediate image deletion
  */
 app.post('/api/verify', async (req, res) => {
   metrics.verificationAttempts++;
   const { image } = req.body;
-  if (!image) return res.status(400).json({ error: 'Image data required' });
+  if (!image) return res.status(400).json({ verified: false, error: 'Image data required' });
 
-  // Convert base64 to Buffer (processed in-memory)
-  const buffer = Buffer.from(image.split(',')[1], 'base64');
+  try {
+    // Convert base64 to Buffer (processed in-memory)
+    const base64Data = image.split(',')[1];
+    const buffer = Buffer.from(base64Data, 'base64');
 
-  // Decision Logic: Real Cloud AI vs Deterministic Heuristic (Proper Hybrid Engine)
-  const apiToken = process.env.HF_API_TOKEN;
-  const hasToken = apiToken && apiToken !== 'your_huggingface_token_here';
-
-  let detected = 'M';
-  let confidence = 0.95;
-  let source = 'local-deterministic';
-
-  if (hasToken) {
-    console.log('AI Engine: Calling Cloud AI (Real Inference)...');
-    const aiResult = await queryHuggingFace(buffer);
+    // Create form data for the Python service
+    const FormData = require('form-data');
+    const formData = new FormData();
     
-    if (aiResult && Array.isArray(aiResult)) {
-      const maleScore = aiResult.find(r => r.label.toLowerCase() === 'male' || r.label.toLowerCase() === 'm')?.score || 0;
-      const femaleScore = aiResult.find(r => r.label.toLowerCase() === 'female' || r.label.toLowerCase() === 'f')?.score || 0;
-      detected = maleScore > femaleScore ? 'M' : 'F';
-      confidence = Math.max(maleScore, femaleScore);
-      source = 'cloud-ai';
-    } else {
-      console.warn('AI Engine: Cloud AI failed, falling back to local heuristic');
-    }
-  } else {
-    // Deterministic Heuristic: Analyze buffer length to produce a consistent result for testing
-    // This is NOT random. It produces the same result for the same "data" to feel real.
-    const sum = buffer.reduce((acc, val, i) => i < 100 ? acc + val : acc, 0);
-    detected = sum % 2 === 0 ? 'F' : 'M';
-    console.log(`AI Engine: Token Missing. Using Local Deterministic Analysis -> ${detected}`);
-  }
+    // Append the image as a file blob
+    formData.append('image', buffer, {
+      filename: 'capture.jpg',
+      contentType: 'image/jpeg'
+    });
 
-  metrics.verificationSuccess++;
-  res.json({
-    success: true,
-    gender: detected,
-    confidence: confidence,
-    source: source,
-    message: source === 'cloud-ai' ? 'Real Cloud AI verification complete.' : 'Verification complete (Dev Mode).'
-  });
+    console.log('Gender Service: Forwarding to Python gender detection service...');
+
+    // Call the Python gender detection service
+    const response = await fetch(`${GENDER_SERVICE_URL}/verify-gender`, {
+      method: 'POST',
+      body: formData,
+      headers: formData.getHeaders()
+    });
+
+    const data = await response.json();
+
+    // Map the response from gender service to frontend format
+    if (data.verified === true) {
+      metrics.verificationSuccess++;
+      console.log(`Gender Service: Verification successful - Gender: ${data.gender}`);
+      
+      res.json({
+        verified: true,
+        gender: data.gender
+      });
+    } else {
+      console.log(`Gender Service: Verification failed - ${data.error}`);
+      res.json({
+        verified: false,
+        error: data.error || 'Verification failed'
+      });
+    }
+  } catch (error) {
+    console.error('Gender Service: Error calling gender detection service:', error.message);
+    res.json({
+      verified: false,
+      error: 'Unable to connect to gender detection service. Please ensure it is running.'
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3002;
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+const shutdown = async () => {
+  console.log('Graceful shutdown initiated...');
+  try {
+    await Promise.all([pubClient.quit(), subClient.quit()]);
+  } catch (err) {
+    console.error('Error during Redis shutdown:', err);
+  }
+  httpServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000).unref();
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
